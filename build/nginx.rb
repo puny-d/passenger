@@ -25,11 +25,14 @@
 auto_generated_sources = %w(
   src/nginx_module/ConfigurationCommands.c
   src/nginx_module/ConfigurationSetters.c
+  src/nginx_module/SetConfigDefaults.c
   src/nginx_module/CreateMainConfig.c
+  src/nginx_module/TrackMainConfig.c
   src/nginx_module/MainConfig.h
   src/nginx_module/CreateLocationConfig.c
   src/nginx_module/MergeLocationConfig.c
   src/nginx_module/CacheLocationConfig.c
+  src/nginx_module/TrackLocationConfig.c
   src/nginx_module/LocationConfig.h
 )
 

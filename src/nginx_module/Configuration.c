@@ -41,6 +41,8 @@
 #include "CreateMainConfig.c"
 #include "CreateLocationConfig.c"
 #include "cxx_supportlib/Constants.h"
+#include "cxx_supportlib/JsonTools/CBindings.h"
+#include "cxx_supportlib/FileTools/PathManipCBindings.h"
 #include "cxx_supportlib/vendor-modified/modp_b64.h"
 
 
@@ -63,6 +65,36 @@ static ngx_path_init_t  ngx_http_proxy_temp_path = {
     ngx_string(NGX_HTTP_PROXY_TEMP_PATH), { 1, 2, 0 }
 };
 
+static void init_manifest_config_entry(PsgJsonValue *entry);
+static PsgJsonValue *find_or_create_manifest_global_config_entry(
+    postprocess_ctx_t *ctx, const char *option_name,
+    size_t option_name_len);
+static PsgJsonValue *find_or_create_manifest_application_config_entry(
+    postprocess_ctx_t *ctx, ngx_str_t *app_group_name,
+    const char *option_name, size_t option_name_len);
+static PsgJsonValue *find_or_create_manifest_location_config_entry(
+    postprocess_ctx_t *ctx, ngx_str_t *app_group_name,
+    ngx_http_core_srv_conf_t *cscf, ngx_http_core_loc_conf_t *clcf,
+    const char *option_name, size_t option_name_len);
+static PsgJsonValue *add_manifest_config_option_hierarchy_member(
+    PsgJsonValue *config_entry, ngx_str_t *source_file, ngx_uint_t source_line);
+static void add_manifest_config_entry_dynamic_default(
+    PsgJsonValue *global_config,
+    const char *option_name, size_t option_name_len,
+    const char *desc, size_t desc_len);
+static void add_manifest_config_entry_static_default_str(
+    PsgJsonValue *global_config,
+    const char *option_name, size_t option_name_len,
+    const char *value, size_t value_len);
+static void add_manifest_config_entry_static_default_int(
+    PsgJsonValue *global_config, const char *option_name,
+    size_t option_name_len, int value);
+static void add_manifest_config_entry_static_default_uint(
+    PsgJsonValue *global_config, const char *option_name,
+    size_t option_name_len, unsigned int value);
+static void add_manifest_config_entry_static_default_bool(
+    PsgJsonValue *global_config, const char *option_name,
+    size_t option_name_len, int value);
 static void postprocess_location_conf(postprocess_ctx_t *ctx,
     passenger_loc_conf_t *passenger_conf);
 static ngx_int_t merge_headers(ngx_conf_t *cf, passenger_loc_conf_t *conf,
@@ -73,7 +105,10 @@ static ngx_int_t merge_string_keyval_table(ngx_conf_t *cf, ngx_array_t **prev,
     ngx_array_t **conf);
 
 
+#include "SetConfigDefaults.c"
+#include "TrackMainConfig.c"
 #include "MergeLocationConfig.c"
+#include "TrackLocationConfig.c"
 
 
 void *
@@ -985,16 +1020,873 @@ merge_string_array(ngx_conf_t *cf, ngx_array_t **prev, ngx_array_t **conf)
 
 struct postprocess_ctx_s {
     ngx_conf_t *cf;
+    PsgJsonValue *json;
+    PsgJsonValueIterator *it, *end;
+    PsgJsonValueIterator *it2, *end2;
+    PsgJsonValueIterator *it3, *end3;
+    PsgJsonValueIterator *it4, *end4;
 };
+
+static void
+init_manifest(PsgJsonValue *manifest) {
+    PsgJsonValue *empty_object;
+
+    empty_object = psg_json_value_new_with_type(PSG_JSON_VALUE_TYPE_OBJECT);
+    psg_json_value_set_value(manifest, "global_configuration", -1, empty_object);
+    psg_json_value_set_value(manifest, "default_application_configuration", -1, empty_object);
+    psg_json_value_set_value(manifest, "default_location_configuration", -1, empty_object);
+    psg_json_value_set_value(manifest, "application_configuration", -1, empty_object);
+    psg_json_value_free(empty_object);
+}
+
+static void
+init_manifest_app_config_container(PsgJsonValue *container) {
+    PsgJsonValue *empty_object, *empty_array;
+    empty_object = psg_json_value_new_with_type(PSG_JSON_VALUE_TYPE_OBJECT);
+    empty_array = psg_json_value_new_with_type(PSG_JSON_VALUE_TYPE_ARRAY);
+    psg_json_value_set_value(container, "options", -1, empty_object);
+    psg_json_value_set_value(container, "default_location_configuration", -1, empty_object);
+    psg_json_value_set_value(container, "locations", -1, empty_array);
+    psg_json_value_free(empty_object);
+    psg_json_value_free(empty_array);
+}
+
+static void
+init_manifest_config_entry(PsgJsonValue *entry) {
+    PsgJsonValue *empty_array = psg_json_value_new_with_type(PSG_JSON_VALUE_TYPE_ARRAY);
+    psg_json_value_set_value(entry, "value_hierarchy", -1, empty_array);
+    psg_json_value_free(empty_array);
+}
+
+static int
+matches_any_server_names(postprocess_ctx_t *ctx, ngx_http_core_srv_conf_t *cscf, PsgJsonValue *server_names_doc) {
+    ngx_http_server_name_t *server_names = cscf->server_names.elts;
+    PsgJsonValue *server_name_doc;
+    ngx_str_t server_name;
+    ngx_uint_t i;
+
+    psg_json_value_begin(server_names_doc, ctx->it2);
+    psg_json_value_end(server_names_doc, ctx->end2);
+
+    while (!psg_json_value_iterator_eq(ctx->it2, ctx->end2)) {
+        server_name_doc = psg_json_value_iterator_get_value(ctx->it2);
+        server_name.data = (u_char *) psg_json_value_get_str(server_name_doc, &server_name.len);
+
+        for (i = 0; i < cscf->server_names.nelts; i++) {
+            if (server_names[i].name.len == server_name.len
+                && ngx_strncasecmp(server_names[i].name.data, server_name.data,
+                                   server_name.len) == 0)
+            {
+                return 1;
+            }
+        }
+
+        psg_json_value_iterator_advance(ctx->it2);
+    }
+
+    return 0;
+}
+
+static PsgJsonValue *
+find_matching_location_entry(postprocess_ctx_t *ctx, ngx_http_core_srv_conf_t *cscf,
+    ngx_http_core_loc_conf_t *clcf, PsgJsonValue *app_config)
+{
+    PsgJsonValue *locations_doc;
+    PsgJsonValue *location_doc;
+    PsgJsonValue *vhost_doc;
+    PsgJsonValue *server_names_doc;
+    PsgJsonValue *location_matcher_doc;
+    ngx_str_t json_location_matcher_type, json_location_matcher_value;
+
+    locations_doc = psg_json_value_get(app_config, "locations", -1);
+    psg_json_value_begin(locations_doc, ctx->it);
+    psg_json_value_end(locations_doc, ctx->end);
+
+    while (!psg_json_value_iterator_eq(ctx->it, ctx->end)) {
+        location_doc = psg_json_value_iterator_get_value(ctx->it);
+        vhost_doc = psg_json_value_get(location_doc, "web_server_virtual_host", -1);
+        location_matcher_doc = psg_json_value_get(location_doc, "location_matcher", -1);
+
+        json_location_matcher_type.data = (u_char *) psg_json_value_get_str(
+            psg_json_value_get(location_matcher_doc, "type", -1),
+            &json_location_matcher_type.len);
+        #if (NGX_PCRE)
+            if (clcf->regex != NULL) {
+                if (json_location_matcher_type.len != sizeof("regex") - 1
+                    || ngx_memcmp(json_location_matcher_type.data, "regex", sizeof("regex") - 1) != 0)
+                {
+                    goto no_match;
+                }
+            } else
+        #endif
+        if (clcf->exact_match) {
+            if (json_location_matcher_type.len != sizeof("exact") - 1
+                || ngx_memcmp(json_location_matcher_type.data, "exact", sizeof("exact") - 1) != 0)
+            {
+                goto no_match;
+            }
+        } else {
+            if (json_location_matcher_type.len != sizeof("prefix") - 1
+                || ngx_memcmp(json_location_matcher_type.data, "prefix", sizeof("prefix") - 1) != 0)
+            {
+                goto no_match;
+            }
+        }
+
+        json_location_matcher_value.data = (u_char *) psg_json_value_get_str(
+            psg_json_value_get(location_matcher_doc, "value", -1),
+            &json_location_matcher_value.len);
+        if (ngx_memn2cmp(clcf->name.data, json_location_matcher_value.data,
+                         clcf->name.len, json_location_matcher_value.len)
+            != 0)
+        {
+            goto no_match;
+        }
+
+        server_names_doc = psg_json_value_get(vhost_doc, "server_names", -1);
+        if (!matches_any_server_names(ctx, cscf, server_names_doc)) {
+            goto no_match;
+        }
+
+        return location_doc;
+
+        no_match:
+        psg_json_value_iterator_advance(ctx->it);
+    }
+
+    return NULL;
+}
+
+static PsgJsonValue *
+create_location_entry(PsgJsonValue *app_config, ngx_http_core_srv_conf_t *cscf,
+    ngx_http_core_loc_conf_t *clcf, const char *option_name, size_t option_name_size)
+{
+    PsgJsonValue *locations_doc = psg_json_value_get(app_config, "locations", -1);
+    PsgJsonValue *entry = psg_json_value_new_with_type(PSG_JSON_VALUE_TYPE_OBJECT);
+    PsgJsonValue *vhost_doc = psg_json_value_new_with_type(PSG_JSON_VALUE_TYPE_OBJECT);
+    PsgJsonValue *server_names_doc = psg_json_value_new_with_type(PSG_JSON_VALUE_TYPE_ARRAY);
+    PsgJsonValue *location_matcher_doc = psg_json_value_new_with_type(PSG_JSON_VALUE_TYPE_OBJECT);
+    PsgJsonValue *options_doc = psg_json_value_new_with_type(PSG_JSON_VALUE_TYPE_OBJECT);
+    PsgJsonValue *server_name_doc, *result;
+    ngx_http_server_name_t *server_names = cscf->server_names.elts;
+    ngx_uint_t i;
+
+    for (i = 0; i < cscf->server_names.nelts; i++) {
+        server_name_doc = psg_json_value_new_str((const char *) server_names[i].name.data,
+            server_names[i].name.len);
+        psg_json_value_append_val(server_names_doc, server_name_doc);
+        psg_json_value_free(server_name_doc);
+    }
+    psg_json_value_set_value(vhost_doc, "server_names", -1, server_names_doc);
+
+    psg_json_value_set_str(location_matcher_doc, "value",
+        (const char *) clcf->name.data, clcf->name.len);
+    #if (NGX_PCRE)
+        if (clcf->regex != NULL) {
+            psg_json_value_set_str(location_matcher_doc, "type",
+                "regex", -1);
+        } else
+    #endif
+    if (clcf->exact_match) {
+        psg_json_value_set_str(location_matcher_doc, "type",
+            "exact", -1);
+    } else {
+        psg_json_value_set_str(location_matcher_doc, "type",
+            "prefix", -1);
+    }
+
+    psg_json_value_set_value(entry, "web_server_virtual_host", -1, vhost_doc);
+    psg_json_value_set_value(entry, "location_matcher", -1, location_matcher_doc);
+    psg_json_value_set_value(entry, "options", -1, options_doc);
+    result = psg_json_value_append_val(locations_doc, entry);
+    psg_json_value_free(entry);
+    psg_json_value_free(vhost_doc);
+    psg_json_value_free(server_names_doc);
+    psg_json_value_free(location_matcher_doc);
+    psg_json_value_free(options_doc);
+    return result;
+}
+
+static int
+infer_location_conf_app_group_name(postprocess_ctx_t *ctx, passenger_loc_conf_t *passenger_conf,
+    ngx_http_core_loc_conf_t *clcf, ngx_str_t *result)
+{
+    ngx_str_t app_root, app_env;
+    char *abs_path;
+    u_char *buf;
+    void *_unused;
+    size_t buf_size;
+
+    if (passenger_conf->autogenerated.app_group_name.data == NULL) {
+        if (passenger_conf->autogenerated.app_root.data == NULL) {
+            buf_size = clcf->root.len + sizeof("/..") - 1;
+            buf = (u_char *) ngx_pnalloc(ctx->cf->pool, buf_size);
+            if (buf == NULL) {
+                return 0;
+            }
+            app_root.data = buf;
+            app_root.len = ngx_snprintf(buf, buf_size, "%V/..", &clcf->root) - buf;
+        } else {
+            app_root = passenger_conf->autogenerated.app_root;
+        }
+
+        abs_path = psg_absolutize_path(
+            (const char *) app_root.data, app_root.len,
+            (const char *) ctx->cf->cycle->prefix.data, ctx->cf->cycle->prefix.len,
+            &app_root.len);
+        app_root.data = (u_char *) ngx_pnalloc(ctx->cf->pool, app_root.len);
+        _unused = ngx_copy(app_root.data, abs_path, app_root.len);
+        (void) _unused; /* Shut up compiler warning */
+        free(abs_path);
+
+        if (passenger_conf->autogenerated.environment.data == NULL) {
+            app_env.data = (u_char *) DEFAULT_APP_ENV;
+            app_env.len = sizeof(DEFAULT_APP_ENV) - 1;
+        } else {
+            app_env = passenger_conf->autogenerated.environment;
+        }
+
+        buf_size = app_root.len + app_env.len + sizeof(" ()") - 1;
+        buf = (u_char *) ngx_pnalloc(ctx->cf->pool, buf_size);
+        result->data = buf;
+        result->len = ngx_snprintf(buf, buf_size, "%V (%V)", &app_root, &app_env) - buf;
+    } else {
+        *result = passenger_conf->autogenerated.app_group_name;
+    }
+
+    return 1;
+}
+
+static PsgJsonValue *
+find_or_create_manifest_global_config_entry(postprocess_ctx_t *ctx,
+    const char *option_name, size_t option_name_len)
+{
+    PsgJsonValue *container_doc, *entry;
+
+    container_doc = psg_json_value_get(ctx->json,
+        "global_configuration", -1);
+    entry = psg_json_value_get_or_create_null(container_doc,
+        option_name, option_name_len);
+    if (psg_json_value_is_null(entry)) {
+        init_manifest_config_entry(entry);
+    }
+
+    return entry;
+}
+
+static PsgJsonValue *
+find_or_create_manifest_application_config_entry(postprocess_ctx_t *ctx,
+    ngx_str_t *app_group_name,
+    const char *option_name, size_t option_name_len)
+{
+    PsgJsonValue *container_doc, *app_config_doc, *options_doc, *entry;
+
+    if (app_group_name->len == 0) {
+        /* We are in a global context */
+        container_doc = psg_json_value_get(ctx->json,
+            "default_application_configuration", -1);
+        entry = psg_json_value_get_or_create_null(container_doc,
+            option_name, option_name_len);
+    } else {
+        /* We are in a server or location/if context */
+        container_doc = psg_json_value_get(ctx->json,
+            "application_configuration", -1);
+        app_config_doc = psg_json_value_get_or_create_null(container_doc,
+            (const char *) app_group_name->data, app_group_name->len);
+        if (psg_json_value_is_null(app_config_doc)) {
+            init_manifest_app_config_container(app_config_doc);
+        }
+
+        options_doc = psg_json_value_get(app_config_doc, "options", -1);
+        entry = psg_json_value_get_or_create_null(options_doc,
+            option_name, option_name_len);
+    }
+
+    if (psg_json_value_is_null(entry)) {
+        init_manifest_config_entry(entry);
+    }
+
+    return entry;
+}
+
+static PsgJsonValue *
+find_or_create_manifest_location_config_entry(postprocess_ctx_t *ctx,
+    ngx_str_t *app_group_name, ngx_http_core_srv_conf_t *cscf, ngx_http_core_loc_conf_t *clcf,
+    const char *option_name, size_t option_name_len)
+{
+    PsgJsonValue *container_doc, *app_config_doc, *location_entry_doc, *options_doc, *entry;
+
+    if (app_group_name->len == 0) {
+        /* We are in a global context */
+        container_doc = psg_json_value_get(ctx->json,
+            "default_location_configuration", -1);
+        entry = psg_json_value_get_or_create_null(container_doc,
+            option_name, option_name_len);
+    } else {
+        /* We are in a server or location/if context */
+        container_doc = psg_json_value_get(ctx->json,
+            "application_configuration", -1);
+        app_config_doc = psg_json_value_get_or_create_null(container_doc,
+            (const char *) app_group_name->data, app_group_name->len);
+        if (psg_json_value_is_null(app_config_doc)) {
+            init_manifest_app_config_container(app_config_doc);
+        }
+
+        if (clcf->name.len == 0) {
+            /* We are in a server context */
+            options_doc = psg_json_value_get(app_config_doc, "default_location_configuration", -1);
+        } else {
+            /* We are in a location/if context */
+            location_entry_doc = find_matching_location_entry(ctx, cscf, clcf,
+                app_config_doc);
+            if (location_entry_doc == NULL) {
+                location_entry_doc = create_location_entry(app_config_doc,
+                    cscf, clcf, option_name, option_name_len);
+            }
+            options_doc = psg_json_value_get(location_entry_doc, "options", -1);
+        }
+
+        entry = psg_json_value_get_or_create_null(options_doc,
+            option_name, option_name_len);
+    }
+
+    if (psg_json_value_is_null(entry)) {
+        init_manifest_config_entry(entry);
+    }
+
+    return entry;
+}
+
+static PsgJsonValue *
+add_manifest_config_option_hierarchy_member(PsgJsonValue *config_entry,
+    ngx_str_t *source_file, ngx_uint_t source_line)
+{
+    PsgJsonValue *value_hierarchy = psg_json_value_get(config_entry, "value_hierarchy", -1);
+    PsgJsonValue *hierarchy_member = psg_json_value_new_with_type(PSG_JSON_VALUE_TYPE_OBJECT);
+    PsgJsonValue *source = psg_json_value_new_with_type(PSG_JSON_VALUE_TYPE_OBJECT);
+    PsgJsonValue *result;
+
+    psg_json_value_set_str(source, "type", "web-server-config", sizeof("web-server-config") - 1);
+    psg_json_value_set_str(source, "path", (const char *) source_file->data, source_file->len);
+    psg_json_value_set_uint(source, "line", source_line);
+    psg_json_value_set_value(hierarchy_member, "source", -1, source);
+    result = psg_json_value_append_val(value_hierarchy, hierarchy_member);
+
+    psg_json_value_free(hierarchy_member);
+    psg_json_value_free(source);
+
+    return result;
+}
+
+static void
+add_manifest_config_entry_dynamic_default(PsgJsonValue *global_config,
+    const char *option_name, size_t option_name_len,
+    const char *desc, size_t desc_len)
+{
+    PsgJsonValue *entry, *hierarchy, *hierarchy_member, *source;
+
+    entry = psg_json_value_get_or_create_null(global_config, option_name, option_name_len);
+    if (psg_json_value_is_null(entry)) {
+        init_manifest_config_entry(entry);
+    }
+    hierarchy = psg_json_value_get(entry, "value_hierarchy", -1);
+
+    source = psg_json_value_new_with_type(PSG_JSON_VALUE_TYPE_OBJECT);
+    psg_json_value_set_str(source, "type", "dynamic-default-description", -1);
+
+    hierarchy_member = psg_json_value_new_with_type(PSG_JSON_VALUE_TYPE_OBJECT);
+    psg_json_value_set_value(hierarchy_member, "source", -1, source);
+    psg_json_value_set_str(hierarchy_member, "value", desc, desc_len);
+
+    psg_json_value_append_val(hierarchy, hierarchy_member);
+
+    psg_json_value_free(hierarchy_member);
+    psg_json_value_free(source);
+}
+
+static PsgJsonValue *
+add_manifest_config_entry_static_default(PsgJsonValue *global_config,
+    const char *option_name, size_t option_name_len)
+{
+    PsgJsonValue *entry, *hierarchy, *hierarchy_member, *source, *result;
+
+    entry = psg_json_value_get_or_create_null(global_config, option_name, option_name_len);
+    if (psg_json_value_is_null(entry)) {
+        init_manifest_config_entry(entry);
+    }
+    hierarchy = psg_json_value_get(entry, "value_hierarchy", -1);
+
+    source = psg_json_value_new_with_type(PSG_JSON_VALUE_TYPE_OBJECT);
+    psg_json_value_set_str(source, "type", "default", -1);
+
+    hierarchy_member = psg_json_value_new_with_type(PSG_JSON_VALUE_TYPE_OBJECT);
+    psg_json_value_set_value(hierarchy_member, "source", -1, source);
+
+    result = psg_json_value_append_val(hierarchy, hierarchy_member);
+
+    psg_json_value_free(hierarchy_member);
+    psg_json_value_free(source);
+
+    return result;
+}
+
+static void
+add_manifest_config_entry_static_default_str(PsgJsonValue *global_config,
+    const char *option_name, size_t option_name_len,
+    const char *value, size_t value_len)
+{
+    PsgJsonValue *hierarchy_member = add_manifest_config_entry_static_default(
+        global_config, option_name, option_name_len);
+    psg_json_value_set_str(hierarchy_member, "value", value, value_len);
+}
+
+static void
+add_manifest_config_entry_static_default_int(PsgJsonValue *global_config,
+    const char *option_name, size_t option_name_len, int value)
+{
+    PsgJsonValue *hierarchy_member = add_manifest_config_entry_static_default(
+        global_config, option_name, option_name_len);
+    psg_json_value_set_int(hierarchy_member, "value", value);
+}
+
+static void
+add_manifest_config_entry_static_default_uint(PsgJsonValue *global_config,
+    const char *option_name, size_t option_name_len, unsigned int value)
+{
+    PsgJsonValue *hierarchy_member = add_manifest_config_entry_static_default(
+        global_config, option_name, option_name_len);
+    psg_json_value_set_uint(hierarchy_member, "value", value);
+}
+
+static void
+add_manifest_config_entry_static_default_bool(PsgJsonValue *global_config,
+    const char *option_name, size_t option_name_len, int value)
+{
+    PsgJsonValue *hierarchy_member = add_manifest_config_entry_static_default(
+        global_config, option_name, option_name_len);
+    psg_json_value_set_bool(hierarchy_member, "value", value);
+}
 
 static void
 postprocess_location_conf(postprocess_ctx_t *ctx, passenger_loc_conf_t *passenger_conf) {
     passenger_loc_conf_t **children;
+    ngx_http_core_srv_conf_t *cscf;
+    ngx_http_core_loc_conf_t *clcf;
+    ngx_str_t app_group_name;
     ngx_uint_t i;
+
+    cscf = passenger_conf->cscf;
+    clcf = passenger_conf->clcf;
+
+    if (cscf != NULL && clcf != NULL) {
+        if (cscf->server_name.len == 0) {
+            /* We are in the global context */
+            app_group_name.data = NULL;
+            app_group_name.len = 0;
+        } else {
+            /* We are in a server or location/if context */
+            infer_location_conf_app_group_name(ctx, passenger_conf, clcf, &app_group_name);
+        }
+
+        passenger_track_autogenerated_loc_conf(ctx, passenger_conf,
+            cscf, clcf, &app_group_name);
+    }
 
     children = passenger_conf->children.elts;
     for (i = 0; i < passenger_conf->children.nelts; i++) {
         postprocess_location_conf(ctx, children[i]);
+    }
+}
+
+static void
+reverse_value_hierarchies_in_options_list(PsgJsonValue *options_doc,
+    PsgJsonValueIterator *it, PsgJsonValueIterator *end)
+{
+    PsgJsonValue *option_doc, *value_hierarchy_doc;
+    unsigned int i, len;
+
+    psg_json_value_begin(options_doc, it);
+    psg_json_value_end(options_doc, end);
+    while (!psg_json_value_iterator_eq(it, end)) {
+        option_doc = psg_json_value_iterator_get_value(it);
+        value_hierarchy_doc = psg_json_value_get(option_doc, "value_hierarchy", -1);
+        len = psg_json_value_size(value_hierarchy_doc);
+
+        for (i = 0; i < len / 2; i++) {
+            psg_json_value_swap(
+                psg_json_value_get_at_index(value_hierarchy_doc, i),
+                psg_json_value_get_at_index(value_hierarchy_doc, len - i - 1));
+        }
+
+        psg_json_value_iterator_advance(it);
+    }
+}
+
+static void
+reverse_value_hierarchies(postprocess_ctx_t *ctx) {
+    PsgJsonValue *app_config_containers, *app_config_container;
+    PsgJsonValue *location_config_containers, *location_config_container;
+    PsgJsonValue *options_doc;
+
+    options_doc = psg_json_value_get(ctx->json, "global_configuration", -1);
+    reverse_value_hierarchies_in_options_list(options_doc, ctx->it, ctx->end);
+
+    options_doc = psg_json_value_get(ctx->json, "default_application_configuration", -1);
+    reverse_value_hierarchies_in_options_list(options_doc, ctx->it, ctx->end);
+
+    options_doc = psg_json_value_get(ctx->json, "default_location_configuration", -1);
+    reverse_value_hierarchies_in_options_list(options_doc, ctx->it, ctx->end);
+
+    app_config_containers = psg_json_value_get(ctx->json, "application_configuration", -1);
+    psg_json_value_begin(app_config_containers, ctx->it);
+    psg_json_value_end(app_config_containers, ctx->end);
+    while (!psg_json_value_iterator_eq(ctx->it, ctx->end)) {
+        app_config_container = psg_json_value_iterator_get_value(ctx->it);
+
+        options_doc = psg_json_value_get(app_config_container, "options", -1);
+        reverse_value_hierarchies_in_options_list(options_doc, ctx->it2, ctx->end2);
+
+        options_doc = psg_json_value_get(app_config_container, "default_location_configuration", -1);
+        reverse_value_hierarchies_in_options_list(options_doc, ctx->it2, ctx->end2);
+
+        location_config_containers = psg_json_value_get(app_config_container, "locations", -1);
+        if (location_config_containers != NULL) {
+            psg_json_value_begin(location_config_containers, ctx->it2);
+            psg_json_value_end(location_config_containers, ctx->end2);
+            while (!psg_json_value_iterator_eq(ctx->it2, ctx->end2)) {
+                location_config_container = psg_json_value_iterator_get_value(ctx->it2);
+
+                options_doc = psg_json_value_get(location_config_container, "options", -1);
+                reverse_value_hierarchies_in_options_list(options_doc, ctx->it3, ctx->end3);
+
+                psg_json_value_iterator_advance(ctx->it2);
+            }
+        }
+
+        psg_json_value_iterator_advance(ctx->it);
+    }
+}
+
+static void
+psg_json_value_append_vals(PsgJsonValue *doc, PsgJsonValue *doc2,
+    PsgJsonValueIterator *it, PsgJsonValueIterator *end)
+{
+    PsgJsonValue *elem;
+
+    psg_json_value_begin(doc2, it);
+    psg_json_value_end(doc2, end);
+    while (!psg_json_value_iterator_eq(it, end)) {
+        elem = psg_json_value_iterator_get_value(it);
+        psg_json_value_append_val(doc, elem);
+        psg_json_value_iterator_advance(it);
+    }
+}
+
+static void
+set_manifest_application_conf_defaults(postprocess_ctx_t *ctx) {
+    PsgJsonValue *default_app_configs = psg_json_value_get(ctx->json,
+        "default_application_configuration", -1);
+    passenger_set_autogenerated_manifest_application_conf_defaults(
+        default_app_configs);
+}
+
+static void
+set_manifest_location_conf_defaults(postprocess_ctx_t *ctx) {
+    PsgJsonValue *default_location_configs = psg_json_value_get(ctx->json,
+        "default_location_configuration", -1);
+    passenger_set_autogenerated_manifest_location_conf_defaults(
+        default_location_configs);
+}
+
+static int
+json_array_contains(PsgJsonValue *doc, PsgJsonValue *elem) {
+    unsigned int i, len;
+    PsgJsonValue *current;
+
+    len = psg_json_value_size(doc);
+    for (i = 0; i < len; i++) {
+        current = psg_json_value_get_at_index(doc, i);
+        if (psg_json_value_eq(current, elem)) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+static void
+maybe_inherit_string_array_hierarchy_values(PsgJsonValue *value_hierarchy_doc,
+    PsgJsonValueIterator *it, PsgJsonValueIterator *end)
+{
+    PsgJsonValue *value, *current, *next, *current_value, *next_value;
+    unsigned int len;
+    int i;
+
+    if (psg_json_value_size(value_hierarchy_doc) == 0) {
+        return;
+    }
+    value = psg_json_value_get(psg_json_value_get_at_index(value_hierarchy_doc, 0),
+        "value", -1);
+    if (psg_json_value_type(value) != PSG_JSON_VALUE_TYPE_ARRAY) {
+        return;
+    }
+
+    len = psg_json_value_size(value_hierarchy_doc);
+    for (i = len - 1; i >= 1; i--) {
+        current = psg_json_value_get_at_index(value_hierarchy_doc, i);
+        next = psg_json_value_get_at_index(value_hierarchy_doc, i - 1);
+
+        current_value = psg_json_value_get(current, "value", -1);
+        next_value = psg_json_value_get(next, "value", -1);
+
+        psg_json_value_begin(current_value, it);
+        psg_json_value_end(current_value, end);
+        while (!psg_json_value_iterator_eq(it, end)) {
+            if (!json_array_contains(next_value, psg_json_value_iterator_get_value(it))) {
+                psg_json_value_append_val(next_value, psg_json_value_iterator_get_value(it));
+            }
+            psg_json_value_iterator_advance(it);
+        }
+    }
+}
+
+static void
+maybe_inherit_string_keyval_hierarchy_values(PsgJsonValue *value_hierarchy_doc,
+    PsgJsonValueIterator *it, PsgJsonValueIterator *end)
+{
+    PsgJsonValue *value, *current, *next, *current_value, *next_value;
+    const char *name;
+    size_t name_len;
+    unsigned int len;
+    int i;
+
+    if (psg_json_value_size(value_hierarchy_doc) == 0) {
+        return;
+    }
+    value = psg_json_value_get(psg_json_value_get_at_index(value_hierarchy_doc, 0),
+        "value", -1);
+    if (psg_json_value_type(value) != PSG_JSON_VALUE_TYPE_OBJECT) {
+        return;
+    }
+
+    len = psg_json_value_size(value_hierarchy_doc);
+    for (i = len - 1; i >= 1; i--) {
+        current = psg_json_value_get_at_index(value_hierarchy_doc, i);
+        next = psg_json_value_get_at_index(value_hierarchy_doc, i - 1);
+
+        current_value = psg_json_value_get(current, "value", -1);
+        next_value = psg_json_value_get(next, "value", -1);
+
+        psg_json_value_begin(current_value, it);
+        psg_json_value_end(current_value, end);
+        while (!psg_json_value_iterator_eq(it, end)) {
+            name = psg_json_value_iterator_get_name(it, &name_len);
+            if (!psg_json_value_is_member(next_value, name, name_len)) {
+                psg_json_value_set_value(next_value, name, name_len,
+                    psg_json_value_iterator_get_value(it));
+            }
+            psg_json_value_iterator_advance(it);
+        }
+    }
+}
+
+static void
+inherit_application_value_hierarchies(postprocess_ctx_t *ctx) {
+    PsgJsonValue *default_app_configs = psg_json_value_get(ctx->json,
+        "default_application_configuration", -1);
+    PsgJsonValue *app_config_containers = psg_json_value_get(ctx->json,
+        "application_configuration", -1);
+    PsgJsonValue *app_config_container, *options_doc, *option_doc, *default_app_config;
+    PsgJsonValue *value_hierarchy_doc, *value_hierarchy_from_default;
+    const char *option_name;
+    size_t option_name_len;
+
+    /* Iterate through all 'application_configuration' objects */
+    psg_json_value_begin(app_config_containers, ctx->it);
+    psg_json_value_end(app_config_containers, ctx->end);
+    while (!psg_json_value_iterator_eq(ctx->it, ctx->end)) {
+        app_config_container = psg_json_value_iterator_get_value(ctx->it);
+
+        /* Iterate through all its 'options' objects */
+        options_doc = psg_json_value_get(app_config_container, "options", -1);
+        psg_json_value_begin(options_doc, ctx->it2);
+        psg_json_value_end(options_doc, ctx->end2);
+        while (!psg_json_value_iterator_eq(ctx->it2, ctx->end2)) {
+            /* For each option, inherit the value hierarchies
+             * from the 'default_application_configuration' object.
+             *
+             * Since the value hierarchy array is already in
+             * most-to-least-specific order, simply appending
+             * the 'default_application_configuration' hierarchy is
+             * enough.
+             */
+            option_name = psg_json_value_iterator_get_name(ctx->it2,
+                &option_name_len);
+            option_doc = psg_json_value_iterator_get_value(ctx->it2);
+            default_app_config = psg_json_value_get(default_app_configs,
+                option_name, option_name_len);
+            if (default_app_config != NULL) {
+                value_hierarchy_doc = psg_json_value_get(option_doc,
+                    "value_hierarchy", -1);
+                value_hierarchy_from_default = psg_json_value_get(default_app_config,
+                    "value_hierarchy", -1);
+                psg_json_value_append_vals(value_hierarchy_doc,
+                    value_hierarchy_from_default,
+                    ctx->it3, ctx->end3);
+                maybe_inherit_string_array_hierarchy_values(value_hierarchy_doc,
+                    ctx->it3, ctx->end3);
+                maybe_inherit_string_keyval_hierarchy_values(value_hierarchy_doc,
+                    ctx->it3, ctx->end3);
+            }
+
+            psg_json_value_iterator_advance(ctx->it2);
+        }
+
+        /* Iterate through all 'default_application_configuration' options */
+        psg_json_value_begin(default_app_configs, ctx->it2);
+        psg_json_value_end(default_app_configs, ctx->end2);
+        while (!psg_json_value_iterator_eq(ctx->it2, ctx->end2)) {
+            /* For each default app config object, if there is no object in
+             * the current context's 'options' with the same name, then add
+             * it there.
+             */
+            option_name = psg_json_value_iterator_get_name(ctx->it2,
+                &option_name_len);
+            if (!psg_json_value_is_member(options_doc, option_name, option_name_len)) {
+                option_doc = psg_json_value_iterator_get_value(ctx->it2);
+                psg_json_value_set_value(options_doc, option_name, option_name_len,
+                    option_doc);
+            }
+
+            psg_json_value_iterator_advance(ctx->it2);
+        }
+
+        psg_json_value_iterator_advance(ctx->it);
+    }
+}
+
+static void
+inherit_location_value_hierarchies(postprocess_ctx_t *ctx) {
+    PsgJsonValue *global_default_location_configs = psg_json_value_get(ctx->json,
+        "default_location_configuration", -1);
+    PsgJsonValue *app_config_containers = psg_json_value_get(ctx->json,
+        "application_configuration", -1);
+    PsgJsonValue *app_config_container, *location_containers, *location_container;
+    PsgJsonValue *app_default_location_configs;
+    PsgJsonValue *options_doc, *option_doc, *default_location_config;
+    PsgJsonValue *value_hierarchy_doc, *value_hierarchy_from_default;
+    const char *option_name;
+    size_t option_name_len;
+
+    /* Iterate through all 'application_configuration' objects */
+    psg_json_value_begin(app_config_containers, ctx->it);
+    psg_json_value_end(app_config_containers, ctx->end);
+    while (!psg_json_value_iterator_eq(ctx->it, ctx->end)) {
+        app_config_container = psg_json_value_iterator_get_value(ctx->it);
+
+        /* Iterate through all its 'default_location_configuration' options */
+        app_default_location_configs = psg_json_value_get(app_config_container,
+            "default_location_configuration", -1);
+        options_doc = app_default_location_configs;
+        psg_json_value_begin(options_doc, ctx->it2);
+        psg_json_value_end(options_doc, ctx->end2);
+        while (!psg_json_value_iterator_eq(ctx->it2, ctx->end2)) {
+            /* For each option, inherit the value hierarchies
+             * from the top-level 'default_application_configuration' object.
+             *
+             * Since the value hierarchy array is already in
+             * most-to-least-specific order, simply appending
+             * the 'default_application_configuration' hierarchy is
+             * enough.
+             */
+            option_name = psg_json_value_iterator_get_name(ctx->it2, &option_name_len);
+            option_doc = psg_json_value_iterator_get_value(ctx->it2);
+            default_location_config = psg_json_value_get(global_default_location_configs,
+                option_name, option_name_len);
+            if (default_location_config != NULL) {
+                value_hierarchy_doc = psg_json_value_get(option_doc,
+                    "value_hierarchy", -1);
+                value_hierarchy_from_default = psg_json_value_get(default_location_config,
+                    "value_hierarchy", -1);
+                psg_json_value_append_vals(value_hierarchy_doc,
+                    value_hierarchy_from_default,
+                    ctx->it3, ctx->end3);
+                maybe_inherit_string_array_hierarchy_values(value_hierarchy_doc,
+                    ctx->it3, ctx->end3);
+                maybe_inherit_string_keyval_hierarchy_values(value_hierarchy_doc,
+                    ctx->it3, ctx->end3);
+            }
+
+            psg_json_value_iterator_advance(ctx->it2);
+        }
+
+        /* Iterate through all top-level 'default_location_configuration' options */
+        psg_json_value_begin(global_default_location_configs, ctx->it2);
+        psg_json_value_end(global_default_location_configs, ctx->end2);
+        while (!psg_json_value_iterator_eq(ctx->it2, ctx->end2)) {
+            /* For each default top-level 'default_location_configuration' option,
+             * if there is no object in the current context's 'default_application_configuration'
+             * with the same name, then add it there.
+             */
+            option_name = psg_json_value_iterator_get_name(ctx->it2,
+                &option_name_len);
+            if (!psg_json_value_is_member(options_doc, option_name, option_name_len)) {
+                option_doc = psg_json_value_iterator_get_value(ctx->it2);
+                psg_json_value_set_value(options_doc, option_name, option_name_len,
+                    option_doc);
+            }
+
+            psg_json_value_iterator_advance(ctx->it2);
+        }
+
+        /* Iterate through all its 'locations' options */
+        location_containers = psg_json_value_get(app_config_container, "locations", -1);
+        if (location_containers != NULL) {
+            psg_json_value_begin(location_containers, ctx->it2);
+            psg_json_value_end(location_containers, ctx->end2);
+            while (!psg_json_value_iterator_eq(ctx->it2, ctx->end2)) {
+                location_container = psg_json_value_iterator_get_value(ctx->it2);
+
+                options_doc = psg_json_value_get(location_container, "options", -1);
+                psg_json_value_begin(options_doc, ctx->it3);
+                psg_json_value_end(options_doc, ctx->end3);
+                while (!psg_json_value_iterator_eq(ctx->it3, ctx->end3)) {
+                    /* For each option, inherit the value hierarchies
+                     * from the 'default_location_configuration' belonging
+                     * to the current app (which also contains the global
+                     * location config defaults).
+                     *
+                     * Since the value hierarchy array is already in
+                     * most-to-least-specific order, simply appending
+                     * the 'default_location_configuration' hierarchy is
+                     * enough.
+                     */
+                    option_name = psg_json_value_iterator_get_name(ctx->it3, &option_name_len);
+                    option_doc = psg_json_value_iterator_get_value(ctx->it3);
+                    default_location_config = psg_json_value_get(app_default_location_configs,
+                        option_name, option_name_len);
+                    if (default_location_config != NULL) {
+                        value_hierarchy_doc = psg_json_value_get(option_doc,
+                            "value_hierarchy", -1);
+                        value_hierarchy_from_default = psg_json_value_get(default_location_config,
+                            "value_hierarchy", -1);
+                        psg_json_value_append_vals(value_hierarchy_doc,
+                            value_hierarchy_from_default,
+                            ctx->it4, ctx->end4);
+                        maybe_inherit_string_array_hierarchy_values(value_hierarchy_doc,
+                            ctx->it4, ctx->end4);
+                        maybe_inherit_string_keyval_hierarchy_values(value_hierarchy_doc,
+                            ctx->it4, ctx->end4);
+                    }
+
+                    psg_json_value_iterator_advance(ctx->it3);
+                }
+
+                psg_json_value_iterator_advance(ctx->it2);
+            }
+        }
+
+        psg_json_value_iterator_advance(ctx->it);
     }
 }
 
@@ -1007,6 +1899,16 @@ passenger_postprocess_config(ngx_conf_t *cf)
 
     ngx_memzero(&ctx, sizeof(ctx));
     ctx.cf = cf;
+    ctx.json = psg_json_value_new_with_type(PSG_JSON_VALUE_TYPE_OBJECT);
+    init_manifest(ctx.json);
+    ctx.it = psg_json_value_iterator_new();
+    ctx.end = psg_json_value_iterator_new();
+    ctx.it2 = psg_json_value_iterator_new();
+    ctx.end2 = psg_json_value_iterator_new();
+    ctx.it3 = psg_json_value_iterator_new();
+    ctx.end3 = psg_json_value_iterator_new();
+    ctx.it4 = psg_json_value_iterator_new();
+    ctx.end4 = psg_json_value_iterator_new();
 
     passenger_main_conf.default_ruby = toplevel_passenger_conf->autogenerated.ruby;
     if (passenger_main_conf.default_ruby.len == 0) {
@@ -1014,7 +1916,35 @@ passenger_postprocess_config(ngx_conf_t *cf)
         passenger_main_conf.default_ruby.len = strlen(DEFAULT_RUBY);
     }
 
+    passenger_track_autogenerated_main_conf(&ctx, &passenger_main_conf);
+
     postprocess_location_conf(&ctx, toplevel_passenger_conf);
+
+    reverse_value_hierarchies(&ctx);
+    passenger_set_autogenerated_manifest_global_conf_defaults(ctx.json);
+    set_manifest_application_conf_defaults(&ctx);
+    set_manifest_location_conf_defaults(&ctx);
+    inherit_application_value_hierarchies(&ctx);
+    inherit_location_value_hierarchies(&ctx);
+
+    char *jstr = psg_json_value_to_styled_string(ctx.json);
+    //fprintf(stderr, "%s", jstr);
+    fflush(stderr);
+    FILE *f = fopen("/tmp/dump.json", "w");
+    if (f != NULL) {
+        fprintf(f, "%s", jstr);
+        fclose(f);
+    }
+    free(jstr);
+    psg_json_value_free(ctx.json);
+    psg_json_value_iterator_free(ctx.it);
+    psg_json_value_iterator_free(ctx.end);
+    psg_json_value_iterator_free(ctx.it2);
+    psg_json_value_iterator_free(ctx.end2);
+    psg_json_value_iterator_free(ctx.it3);
+    psg_json_value_iterator_free(ctx.end3);
+    psg_json_value_iterator_free(ctx.it4);
+    psg_json_value_iterator_free(ctx.end4);
 
     return NGX_OK;
 }
@@ -1148,6 +2078,55 @@ passenger_obsolete_directive(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     ngx_conf_log_error(NGX_LOG_ALERT, cf, 0, "The '%V' directive is obsolete "
         "and doesn't do anything anymore.", &cmd->name);
     return NGX_CONF_OK;
+}
+
+
+PsgJsonValue *
+psg_json_value_set_str_array(PsgJsonValue *doc, const char *name, ngx_array_t *ary) {
+    PsgJsonValue *subdoc = psg_json_value_new_with_type(PSG_JSON_VALUE_TYPE_ARRAY);
+    PsgJsonValue *elem, *result;
+    ngx_str_t *values;
+    ngx_uint_t i;
+
+    if (ary != NULL) {
+        values = (ngx_str_t *) ary->elts;
+        for (i = 0; i < ary->nelts; i++) {
+            elem = psg_json_value_new_str(
+                (const char *) values[i].data, values[i].len);
+            psg_json_value_append_val(subdoc, elem);
+            psg_json_value_free(elem);
+        }
+    }
+
+    result = psg_json_value_set_value(doc, name, -1, subdoc);
+    psg_json_value_free(subdoc);
+
+    return result;
+}
+
+PsgJsonValue *
+psg_json_value_set_str_keyval(PsgJsonValue *doc, const char *name, ngx_array_t *ary) {
+    PsgJsonValue *subdoc = psg_json_value_new_with_type(PSG_JSON_VALUE_TYPE_OBJECT);
+    PsgJsonValue *elem, *result;
+    ngx_keyval_t *values;
+    ngx_uint_t i;
+
+    if (ary != NULL) {
+        values = (ngx_keyval_t *) ary->elts;
+        for (i = 0; i < ary->nelts; i++) {
+            elem = psg_json_value_new_str(
+                (const char *) values[i].value.data, values[i].value.len);
+            psg_json_value_set_value(subdoc,
+                (const char *) values[i].key.data, values[i].key.len,
+                elem);
+            psg_json_value_free(elem);
+        }
+    }
+
+    result = psg_json_value_set_value(doc, name, -1, subdoc);
+    psg_json_value_free(subdoc);
+
+    return result;
 }
 
 

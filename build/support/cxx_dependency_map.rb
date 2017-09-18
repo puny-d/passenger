@@ -9273,6 +9273,8 @@ CXX_DEPENDENCY_MAP =
    "src/cxx_supportlib/Exceptions.h",
    "src/cxx_supportlib/FileTools/FileManip.h",
    "src/cxx_supportlib/FileTools/PathManip.h",
+   "src/cxx_supportlib/FileTools/PathManipCBindings.h",
+   "src/cxx_supportlib/JsonTools/CBindings.h",
    "src/cxx_supportlib/LoggingKit/Assert.h",
    "src/cxx_supportlib/LoggingKit/Forward.h",
    "src/cxx_supportlib/LoggingKit/Logging.h",
@@ -9302,7 +9304,10 @@ CXX_DEPENDENCY_MAP =
    "src/nginx_module/CreateMainConfig.c",
    "src/nginx_module/LocationConfig.h",
    "src/nginx_module/MainConfig.h",
-   "src/nginx_module/MergeLocationConfig.c"],
+   "src/nginx_module/MergeLocationConfig.c",
+   "src/nginx_module/SetConfigDefaults.c",
+   "src/nginx_module/TrackLocationConfig.c",
+   "src/nginx_module/TrackMainConfig.c"],
  "src/nginx_module/Configuration.h"=>
   ["src/nginx_module/LocationConfig.h",
    "src/nginx_module/MainConfig.h"],
@@ -9376,9 +9381,15 @@ CXX_DEPENDENCY_MAP =
   [],
  "src/nginx_module/MergeLocationConfig.c"=>
   [],
+ "src/nginx_module/SetConfigDefaults.c"=>
+  [],
  "src/nginx_module/StaticContentHandler.c"=>
   ["src/nginx_module/StaticContentHandler.h"],
  "src/nginx_module/StaticContentHandler.h"=>
+  [],
+ "src/nginx_module/TrackLocationConfig.c"=>
+  [],
+ "src/nginx_module/TrackMainConfig.c"=>
   [],
  "src/nginx_module/ngx_http_passenger_module.c"=>
   ["src/cxx_supportlib/AppTypes.h",

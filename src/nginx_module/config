@@ -61,10 +61,12 @@ PASSENGER_MODULE_DEPS="${ngx_addon_dir}/Configuration.h \
     ${ngx_addon_dir}/ConfigurationSetters.c \
     ${ngx_addon_dir}/MainConfig.h \
     ${ngx_addon_dir}/CreateMainConfig.c \
+    ${ngx_addon_dir}/TrackMainConfig.c \
     ${ngx_addon_dir}/LocationConfig.h \
     ${ngx_addon_dir}/CreateLocationConfig.c \
     ${ngx_addon_dir}/MergeLocationConfig.c \
     ${ngx_addon_dir}/CacheLocationConfig.c \
+    ${ngx_addon_dir}/TrackLocationConfig.c \
     ${ngx_addon_dir}/ContentHandler.h \
     ${ngx_addon_dir}/StaticContentHandler.h \
     ${ngx_addon_dir}/ngx_http_passenger_module.h \
