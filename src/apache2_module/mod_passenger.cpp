@@ -24,7 +24,7 @@
  *  THE SOFTWARE.
  */
 
-#include "Configuration.hpp"
+#include "Config.h"
 #include "Hooks.h"
 #include <httpd.h>
 #include <http_config.h>
